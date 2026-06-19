@@ -1,0 +1,9 @@
+- task: "Replace password login with passkeys"
+  paths:
+    - lib/boop/accounts
+  must_include:
+    - boop.adr.authentication-identity
+    - boop.spec.registration
+    - boop.plan.passkeys
+  must_not_include:
+    - boop.idea.social-login-every-provider
