@@ -293,11 +293,12 @@ func ContextForTask(ctx context.Context, root, dbPath string, req ContextRequest
 		return ContextManifest{}, err
 	}
 	terms := queryTerms(req.Task)
+	hints := contextHintsFor(req.Task, req.Paths, req.Symbols)
 	candidates := make([]contextCandidate, 0, len(indexableDocs))
 	byID := map[string]Document{}
 	for _, doc := range indexableDocs {
 		byID[doc.ID] = doc
-		score, reasons := contextScore(doc, terms, req.Task, req.Paths, req.Symbols, fts[doc.ID], req.IncludeHistorical)
+		score, reasons := contextScore(doc, terms, req.Task, req.Paths, req.Symbols, hints, fts[doc.ID], req.IncludeHistorical)
 		if len(reasons) == 0 {
 			continue
 		}
@@ -887,7 +888,7 @@ func lexicalScore(doc Document, terms []string, query string, ftsScore float64, 
 	return score, dedupeStrings(reasons)
 }
 
-func contextScore(doc Document, terms []string, query string, paths, symbols []string, ftsScore float64, includeHistorical bool) (float64, []string) {
+func contextScore(doc Document, terms []string, query string, paths, symbols []string, hints map[string]bool, ftsScore float64, includeHistorical bool) (float64, []string) {
 	score, reasons := lexicalScore(doc, terms, query, ftsScore, includeHistorical)
 	for _, path := range paths {
 		if matchesPath(doc, path) {
@@ -912,7 +913,97 @@ func contextScore(doc Document, terms []string, query string, paths, symbols []s
 			}
 		}
 	}
+	if hints["frontend"] && isGoverningDocForHint(doc, "frontend") {
+		score += 150
+		reasons = append(reasons, "governing frontend match")
+	}
 	return score, dedupeStrings(reasons)
+}
+
+func contextHintsFor(task string, paths, symbols []string) map[string]bool {
+	hints := map[string]bool{}
+	for _, term := range queryTerms(task) {
+		if isFrontendTerm(term) {
+			hints["frontend"] = true
+		}
+	}
+	for _, symbol := range symbols {
+		for _, term := range queryTerms(symbol) {
+			if isFrontendTerm(term) {
+				hints["frontend"] = true
+			}
+		}
+	}
+	for _, path := range paths {
+		if isFrontendPath(path) {
+			hints["frontend"] = true
+		}
+	}
+	return hints
+}
+
+func isFrontendTerm(term string) bool {
+	switch strings.ToLower(strings.TrimSpace(term)) {
+	case "frontend", "react", "css", "tailwind", "heex", "component", "components", "layout", "ui":
+		return true
+	default:
+		return false
+	}
+}
+
+func isFrontendPath(path string) bool {
+	path = filepath.ToSlash(strings.ToLower(strings.TrimSpace(path)))
+	path = strings.TrimPrefix(path, "./")
+	switch {
+	case path == "assets/js" || strings.HasPrefix(path, "assets/js/"):
+		return true
+	case path == "assets/css" || strings.HasPrefix(path, "assets/css/"):
+		return true
+	case path == "priv/static" || strings.HasPrefix(path, "priv/static/"):
+		return true
+	case strings.HasPrefix(path, "lib/") && (strings.Contains(path, "_web/") || strings.HasSuffix(path, "_web")):
+		return true
+	default:
+		return false
+	}
+}
+
+func isGoverningDocForHint(doc Document, hint string) bool {
+	if !isCurrentStatus(doc.Status) || !isGoverningCandidate(doc) {
+		return false
+	}
+	switch hint {
+	case "frontend":
+		return documentIdentityHasAny(doc, []string{"frontend", "react", "css", "tailwind", "heex", "component", "layout", "ui"})
+	default:
+		return false
+	}
+}
+
+func isGoverningCandidate(doc Document) bool {
+	if doc.Kind != "principle" && !(doc.Kind == "spec" && strings.HasPrefix(filepath.ToSlash(doc.Path), "architecture/")) {
+		return false
+	}
+	return documentIdentityHasAny(doc, []string{"constitution", "principle", "standard", "guideline"})
+}
+
+func documentIdentityHasAny(doc Document, terms []string) bool {
+	identity := strings.ToLower(doc.ID + " " + doc.Title + " " + filepath.ToSlash(doc.Path) + " " + strings.Join(doc.Scope.Domains, " "))
+	for _, term := range terms {
+		if strings.Contains(identity, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCurrentStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "current", "accepted", "active":
+		return true
+	default:
+		return false
+	}
 }
 
 func expandOneHop(candidates []contextCandidate, byID map[string]Document) []contextCandidate {

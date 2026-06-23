@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -122,6 +123,53 @@ func TestContextFrontendTaskIncludesConstitution(t *testing.T) {
 	}
 }
 
+func TestContextIncludesGoverningFrontendDocUnderAdminBudgetPressure(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeMarkdown(t, root, "architecture/frontend-constitution.md", `# Frontend Constitution
+
+These rules apply to React, CSS, Tailwind, component, and layout work across admin surfaces.
+
+## Rules
+
+Prefer CSS grid for page layout and preserve existing component rhythm.
+`)
+	writeMarkdown(t, root, "plans/admin-layout-workspace.md", `---
+id: plans.admin-layout-workspace
+kind: plan
+status: active
+title: Admin Layout Workspace
+---
+
+# Admin Layout Workspace
+
+## Work Log
+
+`+strings.Repeat("Admin layout workspace details for listing media upload client implementation.\n", 160))
+
+	manifest, err := knowledge.ContextForTask(ctx, root, filepath.Join(t.TempDir(), "index.sqlite"), knowledge.ContextRequest{
+		Task:        "build React admin layout for listing media upload",
+		Paths:       []string{"assets/js"},
+		TokenBudget: 2000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := contextIDs(manifest.Documents)
+	if !slices.Contains(ids, "architecture.frontend-constitution") {
+		t.Fatalf("frontend constitution missing from context: %#v", ids)
+	}
+	var foundReason bool
+	for _, doc := range manifest.Documents {
+		if doc.ID == "architecture.frontend-constitution" && slices.Contains(doc.Reasons, "governing frontend match") {
+			foundReason = true
+		}
+	}
+	if !foundReason {
+		t.Fatalf("frontend constitution missing governing reason: %#v", manifest.Documents)
+	}
+}
+
 func TestIncludeHistoricalKeepsExactDoneMatchFindable(t *testing.T) {
 	ctx := context.Background()
 	root := filepath.Join(repoRoot(t), "testdata", "obsidian")
@@ -222,4 +270,15 @@ func affectedIDs(results []knowledge.AffectedDocument) []string {
 		ids = append(ids, result.ID)
 	}
 	return ids
+}
+
+func writeMarkdown(t *testing.T, root, name, content string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
