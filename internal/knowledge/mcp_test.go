@@ -30,6 +30,7 @@ func TestMCPSmoke(t *testing.T) {
 	}{
 		{name: "status", args: map[string]any{}},
 		{name: "validate", args: map[string]any{}},
+		{name: "scope_suggestions", args: map[string]any{"limit": 5}},
 		{name: "search", args: map[string]any{"query": "registration"}},
 		{name: "read", args: map[string]any{"id": "boop.adr.authentication-identity", "heading": "Decision"}},
 		{name: "neighbors", args: map[string]any{"id": "boop.plan.passkeys", "depth": 1}},

@@ -32,6 +32,8 @@ func run(args []string) error {
 		return runIndex(ctx, args[1:])
 	case "status":
 		return runStatus(ctx, args[1:])
+	case "scope-suggest":
+		return runScopeSuggest(args[1:])
 	case "search":
 		return runSearch(ctx, args[1:])
 	case "read":
@@ -165,6 +167,21 @@ func runStatus(ctx context.Context, args []string) error {
 	return printJSON(result)
 }
 
+func runScopeSuggest(args []string) error {
+	fs := flag.NewFlagSet("scope-suggest", flag.ContinueOnError)
+	root := fs.String("root", ".", "knowledge root")
+	codeRoot := fs.String("code-root", "", "optional code root for scoped path validation")
+	limit := fs.Int("limit", 20, "maximum suggestions to print")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	result, err := knowledge.SuggestScopes(*root, knowledge.ScopeSuggestionOptions{CodeRoot: *codeRoot, Limit: *limit})
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
+}
+
 func runRead(args []string) error {
 	fs := flag.NewFlagSet("read", flag.ContinueOnError)
 	root := fs.String("root", ".", "knowledge root")
@@ -262,7 +279,7 @@ func runMCP(args []string) error {
 }
 
 func usage() error {
-	return fmt.Errorf("usage: knowledge <init|check|index|status|search|read|context|graph|affected|mcp> [options]")
+	return fmt.Errorf("usage: knowledge <init|check|index|status|scope-suggest|search|read|context|graph|affected|mcp> [options]")
 }
 
 func printJSON(value any) error {

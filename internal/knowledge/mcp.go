@@ -71,6 +71,11 @@ type statusInput struct {
 	WarningLimit int `json:"warning_limit,omitempty" jsonschema:"maximum warning examples to return, default 20"`
 }
 
+type scopeSuggestionsInput struct {
+	CodeRoot string `json:"code_root,omitempty" jsonschema:"optional code root for scoped path validation"`
+	Limit    int    `json:"limit,omitempty" jsonschema:"maximum suggestions to return, default 20"`
+}
+
 func RunMCP(ctx context.Context, root, dbPath string) error {
 	server := mcp.NewServer(&mcp.Implementation{Name: "knowledge", Version: "v0.1.0"}, nil)
 
@@ -150,6 +155,14 @@ func RunMCP(ctx context.Context, root, dbPath string) error {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
+		Name:        "scope_suggestions",
+		Description: "Suggest repo-relative scope.paths for unscoped knowledge documents.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, input scopeSuggestionsInput) (*mcp.CallToolResult, ScopeSuggestionReport, error) {
+		output, err := SuggestScopes(root, ScopeSuggestionOptions{CodeRoot: input.CodeRoot, Limit: defaultSuggestionLimit(input.Limit)})
+		return nil, output, err
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
 		Name:        "affected_documents",
 		Description: "Find knowledge documents scoped to changed repository paths.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, input affectedDocumentsInput) (*mcp.CallToolResult, affectedDocumentsOutput, error) {
@@ -161,6 +174,13 @@ func RunMCP(ctx context.Context, root, dbPath string) error {
 }
 
 func defaultValidationLimit(value int) int {
+	if value <= 0 {
+		return 20
+	}
+	return value
+}
+
+func defaultSuggestionLimit(value int) int {
 	if value <= 0 {
 		return 20
 	}

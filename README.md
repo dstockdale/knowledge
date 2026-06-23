@@ -20,6 +20,7 @@ mise exec -- go run ./cmd/knowledge check --root testdata/obsidian --warning-lim
 mise exec -- go run ./cmd/knowledge check --root testdata/obsidian --strict
 mise exec -- go run ./cmd/knowledge index --root testdata/corpus
 mise exec -- go run ./cmd/knowledge status --root testdata/corpus
+mise exec -- go run ./cmd/knowledge scope-suggest --root testdata/obsidian --code-root .
 mise exec -- go run ./cmd/knowledge context --root testdata/corpus --task "add passkeys" --path lib/boop/accounts --token-budget 2000
 mise exec -- go build -o bin/knowledge ./cmd/knowledge
 ```
@@ -72,3 +73,20 @@ knowledge index --root docs --strict
 Permissive mode exits successfully when only derived metadata warnings are present. Strict mode turns derived metadata into errors.
 
 Indexing, search, and context retrieval are best-effort in permissive mode. Structural problems such as duplicate IDs or unparseable files are reported and skipped for affected documents, but valid documents remain searchable. MCP `validate`, `search`, `context_for_task`, and `status` return compact validation summaries so agents can see corpus health without receiving hundreds of warnings by default.
+
+## Scope Paths
+
+`scope.paths` connect docs to code paths for `affected_documents` and path-aware retrieval.
+
+Use repo-relative paths. Prefer directory globs for owned areas:
+
+```yaml
+scope:
+  paths:
+    - lib/boopbup/analytics/**
+    - test/boopbup/analytics/**
+```
+
+Use exact files only for cross-cutting entrypoints such as `mix.exs`, `lib/boopbup_web/router.ex`, or other single-file boundaries.
+
+`scope-suggest` reports existing coverage, invalid scoped paths, and suggested path globs for unscoped docs. It is read-only and does not mutate Markdown.
