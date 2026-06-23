@@ -25,7 +25,8 @@ type searchInput struct {
 }
 
 type searchOutput struct {
-	Results []SearchResult `json:"results"`
+	Results    []SearchResult    `json:"results"`
+	Validation ValidationSummary `json:"validation"`
 }
 
 type readInput struct {
@@ -41,14 +42,20 @@ type neighborsInput struct {
 }
 
 type validateInput struct {
-	CodeRoot string `json:"code_root,omitempty" jsonschema:"optional code root for scoped path validation"`
-	Strict   bool   `json:"strict,omitempty" jsonschema:"require explicit knowledge frontmatter contract"`
+	CodeRoot     string `json:"code_root,omitempty" jsonschema:"optional code root for scoped path validation"`
+	Strict       bool   `json:"strict,omitempty" jsonschema:"require explicit knowledge frontmatter contract"`
+	IssueLimit   int    `json:"issue_limit,omitempty" jsonschema:"maximum issue examples to return, default 20"`
+	WarningLimit int    `json:"warning_limit,omitempty" jsonschema:"maximum warning examples to return, default 20"`
 }
 
 type validateOutput struct {
-	Documents int               `json:"documents"`
-	Issues    []ValidationIssue `json:"issues"`
-	Warnings  []ValidationIssue `json:"warnings"`
+	Documents         int               `json:"documents"`
+	IssueCount        int               `json:"issue_count"`
+	WarningCount      int               `json:"warning_count"`
+	Issues            []ValidationIssue `json:"issues"`
+	Warnings          []ValidationIssue `json:"warnings"`
+	IssuesTruncated   bool              `json:"issues_truncated"`
+	WarningsTruncated bool              `json:"warnings_truncated"`
 }
 
 type affectedDocumentsInput struct {
@@ -57,6 +64,11 @@ type affectedDocumentsInput struct {
 
 type affectedDocumentsOutput struct {
 	Documents []AffectedDocument `json:"documents"`
+}
+
+type statusInput struct {
+	IssueLimit   int `json:"issue_limit,omitempty" jsonschema:"maximum issue examples to return, default 20"`
+	WarningLimit int `json:"warning_limit,omitempty" jsonschema:"maximum warning examples to return, default 20"`
 }
 
 func RunMCP(ctx context.Context, root, dbPath string) error {
@@ -80,7 +92,7 @@ func RunMCP(ctx context.Context, root, dbPath string) error {
 		Name:        "search",
 		Description: "Search indexed knowledge documents with lifecycle-aware filters.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input searchInput) (*mcp.CallToolResult, searchOutput, error) {
-		results, err := Search(ctx, root, dbPath, SearchOptions{
+		response, err := SearchWithValidation(ctx, root, dbPath, SearchOptions{
 			Query:             input.Query,
 			Kinds:             input.Kinds,
 			Statuses:          input.Statuses,
@@ -89,7 +101,7 @@ func RunMCP(ctx context.Context, root, dbPath string) error {
 			IncludeHistorical: input.IncludeHistorical,
 			Limit:             input.Limit,
 		})
-		return nil, searchOutput{Results: results}, err
+		return nil, searchOutput{Results: response.Results, Validation: response.Validation}, err
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -112,16 +124,29 @@ func RunMCP(ctx context.Context, root, dbPath string) error {
 		Name:        "validate",
 		Description: "Validate frontmatter, stable ids, relations, headings, and optional scoped paths.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, input validateInput) (*mcp.CallToolResult, validateOutput, error) {
-		docs, err := Load(root)
+		docs, loadIssues, err := LoadBestEffort(root)
 		if err != nil {
 			return nil, validateOutput{}, err
 		}
-		allIssues := ValidateWithOptions(docs, ValidationOptions{CodeRoot: input.CodeRoot, Strict: input.Strict})
+		allIssues := append(loadIssues, ValidateWithOptions(docs, ValidationOptions{CodeRoot: input.CodeRoot, Strict: input.Strict})...)
+		summary := SummarizeValidation(len(docs), allIssues, defaultValidationLimit(input.IssueLimit), defaultValidationLimit(input.WarningLimit))
 		return nil, validateOutput{
-			Documents: len(docs),
-			Issues:    FilterIssues(allIssues, "error"),
-			Warnings:  FilterIssues(allIssues, "warning"),
+			Documents:         summary.Documents,
+			IssueCount:        summary.IssueCount,
+			WarningCount:      summary.WarningCount,
+			Issues:            summary.Issues,
+			Warnings:          summary.Warnings,
+			IssuesTruncated:   summary.IssuesTruncated,
+			WarningsTruncated: summary.WarningsTruncated,
 		}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "status",
+		Description: "Return knowledge root, index freshness, usability, and compact validation status.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input statusInput) (*mcp.CallToolResult, StatusResult, error) {
+		output, err := Status(ctx, root, dbPath, defaultValidationLimit(input.IssueLimit), defaultValidationLimit(input.WarningLimit))
+		return nil, output, err
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -133,4 +158,11 @@ func RunMCP(ctx context.Context, root, dbPath string) error {
 	})
 
 	return server.Run(ctx, &mcp.StdioTransport{})
+}
+
+func defaultValidationLimit(value int) int {
+	if value <= 0 {
+		return 20
+	}
+	return value
 }

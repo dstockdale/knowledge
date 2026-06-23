@@ -72,6 +72,96 @@ func TestAffectedDocumentsMatchesScopedPaths(t *testing.T) {
 	}
 }
 
+func TestAffectedDocumentsNoMatchReturnsEmptySlice(t *testing.T) {
+	results, err := knowledge.AffectedDocuments(corpusRoot(t), []string{"assets/js/no-match.js"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results == nil {
+		t.Fatal("expected empty slice, got nil")
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected no affected documents, got %#v", results)
+	}
+}
+
+func TestSearchExactSpikeTitleBeatsGenericClientMatches(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(repoRoot(t), "testdata", "obsidian")
+	dbPath := filepath.Join(t.TempDir(), "index.sqlite")
+	response, err := knowledge.SearchWithValidation(ctx, root, dbPath, knowledge.SearchOptions{Query: "ClickHouse Client Integration Spike", Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) == 0 {
+		t.Fatal("expected search results")
+	}
+	if response.Results[0].ID != "ideas.analytics.clickhouse-client-integration-spike" {
+		t.Fatalf("top result = %#v", response.Results[0])
+	}
+	if response.Validation.WarningCount == 0 {
+		t.Fatal("expected validation warnings from permissive Obsidian corpus")
+	}
+}
+
+func TestContextFrontendTaskIncludesConstitution(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(repoRoot(t), "testdata", "obsidian")
+	dbPath := filepath.Join(t.TempDir(), "index.sqlite")
+	manifest, err := knowledge.ContextForTask(ctx, root, dbPath, knowledge.ContextRequest{
+		Task:        "frontend layout work",
+		Paths:       []string{"assets/js"},
+		TokenBudget: 2000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := contextIDs(manifest.Documents)
+	if !slices.Contains(ids, "architecture.frontend-constitution") {
+		t.Fatalf("frontend constitution missing from context: %#v", ids)
+	}
+}
+
+func TestIncludeHistoricalKeepsExactDoneMatchFindable(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(repoRoot(t), "testdata", "obsidian")
+	dbPath := filepath.Join(t.TempDir(), "index.sqlite")
+	response, err := knowledge.SearchWithValidation(ctx, root, dbPath, knowledge.SearchOptions{
+		Query:             "Retired ClickHouse Import Plan",
+		IncludeHistorical: true,
+		Limit:             5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) == 0 {
+		t.Fatal("expected historical exact match")
+	}
+	if response.Results[0].ID != "plans.completed.retired-clickhouse-import-plan" {
+		t.Fatalf("top result = %#v", response.Results[0])
+	}
+}
+
+func TestSearchContinuesWithInvalidDocuments(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeDoc(t, root, "a.md", "duplicate.id", "Duplicate A")
+	writeDoc(t, root, "b.md", "duplicate.id", "Duplicate B")
+	writeDoc(t, root, "valid.md", "valid.doc", "Valid Search Target")
+	dbPath := filepath.Join(t.TempDir(), "index.sqlite")
+	response, err := knowledge.SearchWithValidation(ctx, root, dbPath, knowledge.SearchOptions{Query: "Valid Search Target", Limit: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := searchIDs(response.Results)
+	if !slices.Contains(ids, "valid.doc") {
+		t.Fatalf("valid doc missing despite duplicate-id issue: %#v", ids)
+	}
+	if response.Validation.IssueCount == 0 {
+		t.Fatal("expected duplicate-id validation issue")
+	}
+}
+
 func TestContextEvalFixture(t *testing.T) {
 	var evals []struct {
 		Task           string   `yaml:"task"`

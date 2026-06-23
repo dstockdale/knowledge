@@ -22,6 +22,7 @@ var supportedKinds = map[string]bool{
 	"spec":      true,
 	"plan":      true,
 	"idea":      true,
+	"spike":     true,
 	"research":  true,
 	"runbook":   true,
 	"incident":  true,
@@ -83,6 +84,16 @@ type ValidationOptions struct {
 	Strict   bool
 }
 
+type ValidationSummary struct {
+	Documents         int               `json:"documents"`
+	IssueCount        int               `json:"issue_count"`
+	WarningCount      int               `json:"warning_count"`
+	Issues            []ValidationIssue `json:"issues"`
+	Warnings          []ValidationIssue `json:"warnings"`
+	IssuesTruncated   bool              `json:"issues_truncated"`
+	WarningsTruncated bool              `json:"warnings_truncated"`
+}
+
 type frontmatter struct {
 	ID          string              `yaml:"id"`
 	Kind        string              `yaml:"kind"`
@@ -139,6 +150,33 @@ func Load(root string) ([]Document, error) {
 	return docs, nil
 }
 
+func LoadBestEffort(root string) ([]Document, []ValidationIssue, error) {
+	paths, err := Discover(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	docs := make([]Document, 0, len(paths))
+	issues := []ValidationIssue{}
+	for _, path := range paths {
+		doc, err := ParseFile(root, path)
+		if err != nil {
+			rel, relErr := filepath.Rel(root, path)
+			if relErr != nil {
+				rel = path
+			}
+			issues = append(issues, ValidationIssue{
+				Path:     filepath.ToSlash(rel),
+				Severity: "error",
+				Code:     "parse_error",
+				Message:  err.Error(),
+			})
+			continue
+		}
+		docs = append(docs, doc)
+	}
+	return docs, issues, nil
+}
+
 func ParseFile(root, path string) (Document, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -161,9 +199,10 @@ func ParseFile(root, path string) (Document, error) {
 	}
 	bodyText := strings.TrimSpace(string(body))
 	sections := ExtractSections(bodyText)
+	sourceKind := firstNonEmpty(fm.Kind, fm.Type)
 	doc := Document{
 		ID:          strings.TrimSpace(fm.ID),
-		Kind:        normalizeKind(firstNonEmpty(fm.Kind, fm.Type), rel),
+		Kind:        normalizeKind(sourceKind, ""),
 		Status:      strings.TrimSpace(fm.Status),
 		Title:       strings.TrimSpace(fm.Title),
 		Scope:       normalizeScope(fm.Scope),
@@ -186,6 +225,9 @@ func ParseFile(root, path string) (Document, error) {
 	}
 	if !hasFrontmatter {
 		doc.Warnings = append(doc.Warnings, warning(doc, "missing_yaml_frontmatter", "missing YAML frontmatter; metadata was derived from path and headings"))
+	}
+	if sourceKind != "" && !knownKindSource(sourceKind) {
+		doc.Warnings = append(doc.Warnings, warning(doc, "unknown_source_type", fmt.Sprintf("unknown source type %q; normalized to research", strings.TrimSpace(sourceKind))))
 	}
 	if doc.ID == "" {
 		doc.ID = deriveID(rel)
@@ -241,6 +283,8 @@ func normalizeKind(kind, path string) string {
 		return "plan"
 	case "idea":
 		return "idea"
+	case "spike", "research spike":
+		return "spike"
 	case "research", "research note":
 		return "research"
 	case "runbook", "operation", "operations":
@@ -255,8 +299,12 @@ func normalizeKind(kind, path string) string {
 		if strings.HasSuffix(path, ".adr.md") {
 			return "adr"
 		}
-		return strings.ReplaceAll(kind, " ", "-")
+		return "research"
 	}
+}
+
+func knownKindSource(kind string) bool {
+	return normalizeKind(kind, "") != "research" || strings.EqualFold(strings.TrimSpace(kind), "research") || strings.EqualFold(strings.TrimSpace(kind), "research note")
 }
 
 func inferKind(path string) string {
@@ -267,7 +315,12 @@ func inferKind(path string) string {
 	case strings.Contains(path, "/plans/") || strings.HasPrefix(path, "plans/") || strings.HasSuffix(path, ".plan.md"):
 		return "plan"
 	case strings.Contains(path, "/ideas/") || strings.HasPrefix(path, "ideas/") || strings.HasSuffix(path, ".idea.md"):
+		if strings.Contains(path, "spike") {
+			return "spike"
+		}
 		return "idea"
+	case strings.Contains(path, "/spikes/") || strings.HasPrefix(path, "spikes/") || strings.HasSuffix(path, ".spike.md"):
+		return "spike"
 	case strings.Contains(path, "/research/") || strings.HasPrefix(path, "research/") || strings.HasSuffix(path, ".research.md"):
 		return "research"
 	case strings.Contains(path, "/operations/") || strings.HasPrefix(path, "operations/") || strings.HasSuffix(path, ".runbook.md"):
@@ -301,7 +354,7 @@ func inferStatus(path string) string {
 
 func deriveID(path string) string {
 	path = strings.TrimSuffix(filepath.ToSlash(path), ".md")
-	for _, suffix := range []string{".adr", ".plan", ".idea", ".research", ".runbook", ".incident"} {
+	for _, suffix := range []string{".adr", ".plan", ".idea", ".spike", ".research", ".runbook", ".incident"} {
 		path = strings.TrimSuffix(path, suffix)
 	}
 	return strings.ReplaceAll(path, "/", ".")
@@ -433,6 +486,34 @@ func ExtractSections(body string) []Section {
 
 func Validate(docs []Document, codeRoot string) []ValidationIssue {
 	return FilterIssues(ValidateWithOptions(docs, ValidationOptions{CodeRoot: codeRoot}), "error")
+}
+
+func SummarizeValidation(documentCount int, issues []ValidationIssue, issueLimit, warningLimit int) ValidationSummary {
+	errors := FilterIssues(issues, "error")
+	warnings := FilterIssues(issues, "warning")
+	return ValidationSummary{
+		Documents:         documentCount,
+		IssueCount:        len(errors),
+		WarningCount:      len(warnings),
+		Issues:            limitIssues(errors, issueLimit),
+		Warnings:          limitIssues(warnings, warningLimit),
+		IssuesTruncated:   isTruncated(errors, issueLimit),
+		WarningsTruncated: isTruncated(warnings, warningLimit),
+	}
+}
+
+func limitIssues(issues []ValidationIssue, limit int) []ValidationIssue {
+	if limit < 0 || len(issues) <= limit {
+		return issues
+	}
+	if limit == 0 {
+		return []ValidationIssue{}
+	}
+	return issues[:limit]
+}
+
+func isTruncated(issues []ValidationIssue, limit int) bool {
+	return limit >= 0 && len(issues) > limit
 }
 
 func ValidateWithOptions(docs []Document, opts ValidationOptions) []ValidationIssue {
@@ -585,8 +666,11 @@ func strictIssuesForDerived(doc Document) []ValidationIssue {
 		issues = append(issues, issue(doc, "derived_"+field, fmt.Sprintf("strict mode requires explicit %s", field)))
 	}
 	for _, warn := range doc.Warnings {
-		if warn.Code == "missing_yaml_frontmatter" {
+		switch warn.Code {
+		case "missing_yaml_frontmatter":
 			issues = append(issues, issue(doc, warn.Code, "strict mode requires YAML frontmatter"))
+		case "unknown_source_type":
+			issues = append(issues, issue(doc, warn.Code, warn.Message))
 		}
 	}
 	return issues

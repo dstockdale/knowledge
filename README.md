@@ -16,8 +16,10 @@ mise install
 mise exec -- go test ./...
 mise exec -- go run ./cmd/knowledge check --root testdata/corpus
 mise exec -- go run ./cmd/knowledge check --root testdata/obsidian
+mise exec -- go run ./cmd/knowledge check --root testdata/obsidian --warning-limit 20
 mise exec -- go run ./cmd/knowledge check --root testdata/obsidian --strict
 mise exec -- go run ./cmd/knowledge index --root testdata/corpus
+mise exec -- go run ./cmd/knowledge status --root testdata/corpus
 mise exec -- go run ./cmd/knowledge context --root testdata/corpus --task "add passkeys" --path lib/boop/accounts --token-budget 2000
 mise exec -- go build -o bin/knowledge ./cmd/knowledge
 ```
@@ -42,7 +44,7 @@ Optional fields:
 - `created`
 - `review_after`
 
-Supported kinds are `adr`, `spec`, `plan`, `idea`, `research`, `runbook`, `incident`, `principle`, and `glossary`.
+Supported kinds are `adr`, `spec`, `plan`, `idea`, `spike`, `research`, `runbook`, `incident`, `principle`, and `glossary`.
 
 Historical statuses such as `superseded`, `rejected`, `obsolete`, `abandoned`, and `completed` are excluded from task context unless explicitly requested.
 
@@ -54,9 +56,11 @@ Accepted source shapes include:
 
 - `type: adr` or `type: Architecture Decision Record`, normalized to `kind: adr`.
 - `type: architecture`, normalized to `kind: spec`.
+- `type: spike`, `/spikes/`, `/ideas/**/spike`, or `.spike.md`, normalized to `kind: spike`.
 - `area: identity`, added as a scope domain.
 - `source: "[[ideas/example]]"`, added as a `source` relation.
 - Files without YAML frontmatter, with `id`, `kind`, `status`, and `title` derived from path and headings.
+- Unknown source-specific `type` values, normalized to `kind: research` with a warning in permissive mode.
 
 Use strict mode for curated docs that should explicitly follow the knowledge contract:
 
@@ -66,3 +70,5 @@ knowledge index --root docs --strict
 ```
 
 Permissive mode exits successfully when only derived metadata warnings are present. Strict mode turns derived metadata into errors.
+
+Indexing, search, and context retrieval are best-effort in permissive mode. Structural problems such as duplicate IDs or unparseable files are reported and skipped for affected documents, but valid documents remain searchable. MCP `validate`, `search`, `context_for_task`, and `status` return compact validation summaries so agents can see corpus health without receiving hundreds of warnings by default.

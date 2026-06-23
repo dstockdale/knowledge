@@ -28,10 +28,13 @@ func TestMCPSmoke(t *testing.T) {
 		name string
 		args map[string]any
 	}{
+		{name: "status", args: map[string]any{}},
 		{name: "validate", args: map[string]any{}},
 		{name: "search", args: map[string]any{"query": "registration"}},
 		{name: "read", args: map[string]any{"id": "boop.adr.authentication-identity", "heading": "Decision"}},
+		{name: "neighbors", args: map[string]any{"id": "boop.plan.passkeys", "depth": 1}},
 		{name: "context_for_task", args: map[string]any{"task": "add passkeys", "paths": []string{"lib/boop/accounts"}, "token_budget": 2000}},
+		{name: "affected_documents", args: map[string]any{"paths": []string{"lib/boop/accounts/authentication.ex"}}},
 	} {
 		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: call.name, Arguments: call.args})
 		if err != nil {

@@ -30,6 +30,8 @@ func run(args []string) error {
 		return runCheck(args[1:])
 	case "index":
 		return runIndex(ctx, args[1:])
+	case "status":
+		return runStatus(ctx, args[1:])
 	case "search":
 		return runSearch(ctx, args[1:])
 	case "read":
@@ -68,22 +70,22 @@ func runCheck(args []string) error {
 	root := fs.String("root", ".", "knowledge root")
 	codeRoot := fs.String("code-root", "", "optional code root for scoped path validation")
 	strict := fs.Bool("strict", false, "require explicit knowledge frontmatter contract")
+	issueLimit := fs.Int("issue-limit", -1, "maximum issues to print; defaults to all")
+	warningLimit := fs.Int("warning-limit", -1, "maximum warnings to print; defaults to all")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	docs, err := knowledge.Load(*root)
+	docs, loadIssues, err := knowledge.LoadBestEffort(*root)
 	if err != nil {
 		return err
 	}
-	allIssues := knowledge.ValidateWithOptions(docs, knowledge.ValidationOptions{CodeRoot: *codeRoot, Strict: *strict})
-	issues := knowledge.FilterIssues(allIssues, "error")
-	warnings := knowledge.FilterIssues(allIssues, "warning")
-	result := map[string]any{"documents": len(docs), "issues": issues, "warnings": warnings}
-	if err := printJSON(result); err != nil {
+	allIssues := append(loadIssues, knowledge.ValidateWithOptions(docs, knowledge.ValidationOptions{CodeRoot: *codeRoot, Strict: *strict})...)
+	summary := knowledge.SummarizeValidation(len(docs), allIssues, *issueLimit, *warningLimit)
+	if err := printJSON(summary); err != nil {
 		return err
 	}
-	if len(issues) > 0 {
-		return fmt.Errorf("validation failed with %d issue(s)", len(issues))
+	if summary.IssueCount > 0 {
+		return fmt.Errorf("validation failed with %d issue(s)", summary.IssueCount)
 	}
 	return nil
 }
@@ -132,7 +134,7 @@ func runSearch(ctx context.Context, args []string) error {
 	if query == "" {
 		return fmt.Errorf("search requires a query")
 	}
-	results, err := knowledge.Search(ctx, *root, knowledge.ResolveDBPath(*root, *dbPath), knowledge.SearchOptions{
+	response, err := knowledge.SearchWithValidation(ctx, *root, knowledge.ResolveDBPath(*root, *dbPath), knowledge.SearchOptions{
 		Query:             query,
 		Kinds:             kinds,
 		Statuses:          statuses,
@@ -144,7 +146,23 @@ func runSearch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return printJSON(results)
+	return printJSON(response)
+}
+
+func runStatus(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	root := fs.String("root", ".", "knowledge root")
+	dbPath := fs.String("db", "", "index database path")
+	issueLimit := fs.Int("issue-limit", 20, "maximum issues to print")
+	warningLimit := fs.Int("warning-limit", 20, "maximum warnings to print")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	result, err := knowledge.Status(ctx, *root, knowledge.ResolveDBPath(*root, *dbPath), *issueLimit, *warningLimit)
+	if err != nil {
+		return err
+	}
+	return printJSON(result)
 }
 
 func runRead(args []string) error {
@@ -244,7 +262,7 @@ func runMCP(args []string) error {
 }
 
 func usage() error {
-	return fmt.Errorf("usage: knowledge <init|check|index|search|read|context|graph|affected|mcp> [options]")
+	return fmt.Errorf("usage: knowledge <init|check|index|status|search|read|context|graph|affected|mcp> [options]")
 }
 
 func printJSON(value any) error {

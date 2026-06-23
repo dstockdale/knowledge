@@ -39,6 +39,11 @@ type SearchResult struct {
 	Reasons         []string `json:"reasons"`
 }
 
+type SearchResponse struct {
+	Results    []SearchResult    `json:"results"`
+	Validation ValidationSummary `json:"validation"`
+}
+
 type ContextRequest struct {
 	Task              string   `json:"task"`
 	Paths             []string `json:"paths"`
@@ -52,6 +57,7 @@ type ContextManifest struct {
 	EstimatedTokensUsed int               `json:"estimated_tokens_used"`
 	Documents           []ContextDocument `json:"documents"`
 	HistoricalDocuments []ContextDocument `json:"historical_documents"`
+	Validation          ValidationSummary `json:"validation"`
 }
 
 type ContextDocument struct {
@@ -109,6 +115,22 @@ type AffectedDocument struct {
 	EstimatedTokens int      `json:"estimated_tokens"`
 }
 
+type StatusResult struct {
+	Root              string            `json:"root"`
+	DBPath            string            `json:"db_path"`
+	Documents         int               `json:"documents"`
+	IssueCount        int               `json:"issue_count"`
+	WarningCount      int               `json:"warning_count"`
+	Issues            []ValidationIssue `json:"issues"`
+	Warnings          []ValidationIssue `json:"warnings"`
+	IssuesTruncated   bool              `json:"issues_truncated"`
+	WarningsTruncated bool              `json:"warnings_truncated"`
+	DBExists          bool              `json:"db_exists"`
+	IndexStale        bool              `json:"index_stale"`
+	IndexUsable       bool              `json:"index_usable"`
+	IndexedAt         string            `json:"indexed_at,omitempty"`
+}
+
 type contextCandidate struct {
 	doc     Document
 	score   float64
@@ -139,13 +161,11 @@ func EnsureIndex(ctx context.Context, root, dbPath string) error {
 }
 
 func RebuildIndex(ctx context.Context, root, dbPath string) ([]Document, error) {
-	docs, err := Load(root)
+	docs, issues, err := loadValidatedDocuments(root)
 	if err != nil {
 		return nil, err
 	}
-	if issues := Validate(docs, ""); len(issues) > 0 {
-		return nil, fmt.Errorf("validation failed: %s", issues[0].Message)
-	}
+	indexableDocs := indexableDocuments(docs, issues)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, err
 	}
@@ -165,7 +185,7 @@ func RebuildIndex(ctx context.Context, root, dbPath string) ([]Document, error) 
 		_ = tx.Rollback()
 		return nil, err
 	}
-	for _, doc := range docs {
+	for _, doc := range indexableDocs {
 		if err := insertDocument(ctx, tx, doc); err != nil {
 			_ = tx.Rollback()
 			return nil, err
@@ -191,25 +211,34 @@ func RebuildIndex(ctx context.Context, root, dbPath string) ([]Document, error) 
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return docs, nil
+	return indexableDocs, nil
 }
 
 func Search(ctx context.Context, root, dbPath string, opts SearchOptions) ([]SearchResult, error) {
-	if err := EnsureIndex(ctx, root, dbPath); err != nil {
-		return nil, err
-	}
-	docs, err := Load(root)
+	response, err := SearchWithValidation(ctx, root, dbPath, opts)
 	if err != nil {
 		return nil, err
 	}
+	return response.Results, nil
+}
+
+func SearchWithValidation(ctx context.Context, root, dbPath string, opts SearchOptions) (SearchResponse, error) {
+	if err := EnsureIndex(ctx, root, dbPath); err != nil {
+		return SearchResponse{}, err
+	}
+	docs, issues, err := loadValidatedDocuments(root)
+	if err != nil {
+		return SearchResponse{}, err
+	}
+	indexableDocs := indexableDocuments(docs, issues)
 	fts, err := ftsScores(ctx, dbPath, opts.Query)
 	if err != nil {
-		return nil, err
+		return SearchResponse{}, err
 	}
 	terms := queryTerms(opts.Query)
 	var results []SearchResult
-	for _, doc := range docs {
-		if !opts.IncludeHistorical && IsHistorical(doc.Status) {
+	for _, doc := range indexableDocs {
+		if !opts.IncludeHistorical && IsHistorical(doc.Status) && !exactIdentifierOrTitleMatch(doc, opts.Query) {
 			continue
 		}
 		if !matchesAny(doc.Kind, opts.Kinds) || !matchesAny(doc.Status, opts.Statuses) {
@@ -221,7 +250,7 @@ func Search(ctx context.Context, root, dbPath string, opts SearchOptions) ([]Sea
 		if len(opts.Paths) > 0 && !matchesAnyRequestedPath(doc, opts.Paths) {
 			continue
 		}
-		score, reasons := lexicalScore(doc, terms, fts[doc.ID])
+		score, reasons := lexicalScore(doc, terms, opts.Query, fts[doc.ID], opts.IncludeHistorical)
 		if strings.TrimSpace(opts.Query) != "" && len(reasons) == 0 {
 			continue
 		}
@@ -240,17 +269,21 @@ func Search(ctx context.Context, root, dbPath string, opts SearchOptions) ([]Sea
 	if opts.Limit > 0 && len(results) > opts.Limit {
 		results = results[:opts.Limit]
 	}
-	return results, nil
+	return SearchResponse{
+		Results:    results,
+		Validation: SummarizeValidation(len(docs), issues, 20, 20),
+	}, nil
 }
 
 func ContextForTask(ctx context.Context, root, dbPath string, req ContextRequest) (ContextManifest, error) {
 	if err := EnsureIndex(ctx, root, dbPath); err != nil {
 		return ContextManifest{}, err
 	}
-	docs, err := Load(root)
+	docs, issues, err := loadValidatedDocuments(root)
 	if err != nil {
 		return ContextManifest{}, err
 	}
+	indexableDocs := indexableDocuments(docs, issues)
 	budget := req.TokenBudget
 	if budget <= 0 {
 		budget = defaultTokenBudget
@@ -260,12 +293,12 @@ func ContextForTask(ctx context.Context, root, dbPath string, req ContextRequest
 		return ContextManifest{}, err
 	}
 	terms := queryTerms(req.Task)
-	candidates := make([]contextCandidate, 0, len(docs))
+	candidates := make([]contextCandidate, 0, len(indexableDocs))
 	byID := map[string]Document{}
-	for _, doc := range docs {
+	for _, doc := range indexableDocs {
 		byID[doc.ID] = doc
-		score, reasons := contextScore(doc, terms, req.Paths, req.Symbols, fts[doc.ID])
-		if score == 0 {
+		score, reasons := contextScore(doc, terms, req.Task, req.Paths, req.Symbols, fts[doc.ID], req.IncludeHistorical)
+		if len(reasons) == 0 {
 			continue
 		}
 		candidates = append(candidates, contextCandidate{doc: doc, score: score, reasons: reasons})
@@ -277,7 +310,7 @@ func ContextForTask(ctx context.Context, root, dbPath string, req ContextRequest
 		}
 		return candidates[i].score > candidates[j].score
 	})
-	manifest := ContextManifest{TokenBudget: budget}
+	manifest := ContextManifest{TokenBudget: budget, Validation: SummarizeValidation(len(docs), issues, 20, 20)}
 	seen := map[string]bool{}
 	for _, c := range candidates {
 		if seen[c.doc.ID] {
@@ -326,7 +359,7 @@ func shouldListHistorical(doc Document, reasons []string) bool {
 }
 
 func ReadDocument(root, id, heading string, maxTokens int) (ReadResult, error) {
-	docs, err := Load(root)
+	docs, _, err := LoadBestEffort(root)
 	if err != nil {
 		return ReadResult{}, err
 	}
@@ -357,7 +390,7 @@ func ReadDocument(root, id, heading string, maxTokens int) (ReadResult, error) {
 }
 
 func Neighbors(root, id string, relations []string, depth int) (GraphResult, error) {
-	docs, err := Load(root)
+	docs, _, err := LoadBestEffort(root)
 	if err != nil {
 		return GraphResult{}, err
 	}
@@ -423,11 +456,11 @@ func Neighbors(root, id string, relations []string, depth int) (GraphResult, err
 }
 
 func AffectedDocuments(root string, paths []string) ([]AffectedDocument, error) {
-	docs, err := Load(root)
+	docs, _, err := LoadBestEffort(root)
 	if err != nil {
 		return nil, err
 	}
-	var affected []AffectedDocument
+	affected := []AffectedDocument{}
 	for _, doc := range docs {
 		var matched []string
 		for _, changed := range paths {
@@ -451,6 +484,104 @@ func AffectedDocuments(root string, paths []string) ([]AffectedDocument, error) 
 	}
 	sort.SliceStable(affected, func(i, j int) bool { return affected[i].ID < affected[j].ID })
 	return affected, nil
+}
+
+func Status(ctx context.Context, root, dbPath string, issueLimit, warningLimit int) (StatusResult, error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return StatusResult{}, err
+	}
+	absDBPath, err := filepath.Abs(dbPath)
+	if err != nil {
+		return StatusResult{}, err
+	}
+	docs, issues, err := loadValidatedDocuments(root)
+	if err != nil {
+		return StatusResult{}, err
+	}
+	summary := SummarizeValidation(len(docs), issues, issueLimit, warningLimit)
+	_, statErr := os.Stat(dbPath)
+	dbExists := statErr == nil
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return StatusResult{}, statErr
+	}
+	indexStale := true
+	if dbExists {
+		stale, err := indexNeedsRebuild(root, dbPath)
+		if err != nil {
+			indexStale = true
+		} else {
+			indexStale = stale
+		}
+	}
+	metadata, err := readIndexMetadata(ctx, dbPath)
+	if err != nil {
+		return StatusResult{}, err
+	}
+	return StatusResult{
+		Root:              absRoot,
+		DBPath:            absDBPath,
+		Documents:         summary.Documents,
+		IssueCount:        summary.IssueCount,
+		WarningCount:      summary.WarningCount,
+		Issues:            summary.Issues,
+		Warnings:          summary.Warnings,
+		IssuesTruncated:   summary.IssuesTruncated,
+		WarningsTruncated: summary.WarningsTruncated,
+		DBExists:          dbExists,
+		IndexStale:        indexStale,
+		IndexUsable:       len(indexableDocuments(docs, issues)) > 0,
+		IndexedAt:         metadata["indexed_at"],
+	}, nil
+}
+
+func loadValidatedDocuments(root string) ([]Document, []ValidationIssue, error) {
+	docs, loadIssues, err := LoadBestEffort(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	issues := append([]ValidationIssue{}, loadIssues...)
+	issues = append(issues, ValidateWithOptions(docs, ValidationOptions{})...)
+	return docs, issues, nil
+}
+
+func indexableDocuments(docs []Document, issues []ValidationIssue) []Document {
+	blockedIDs := map[string]bool{}
+	blockedPaths := map[string]bool{}
+	for _, issue := range issues {
+		if !isBlockingIndexIssue(issue) {
+			continue
+		}
+		if issue.ID != "" {
+			blockedIDs[issue.ID] = true
+		}
+		if issue.Path != "" {
+			blockedPaths[issue.Path] = true
+		}
+	}
+	out := make([]Document, 0, len(docs))
+	for _, doc := range docs {
+		if doc.ID == "" || doc.Kind == "" || doc.Status == "" || doc.Title == "" {
+			continue
+		}
+		if blockedIDs[doc.ID] || blockedPaths[doc.Path] {
+			continue
+		}
+		out = append(out, doc)
+	}
+	return out
+}
+
+func isBlockingIndexIssue(issue ValidationIssue) bool {
+	if issue.Severity != "error" {
+		return false
+	}
+	switch issue.Code {
+	case "parse_error", "duplicate_id", "missing_id", "missing_kind", "missing_status", "missing_title", "unsupported_kind":
+		return true
+	default:
+		return false
+	}
 }
 
 func createSchema(ctx context.Context, db *sql.DB) error {
@@ -596,6 +727,33 @@ func putMetadata(ctx context.Context, tx *sql.Tx, key, value string) error {
 	return err
 }
 
+func readIndexMetadata(ctx context.Context, dbPath string) (map[string]string, error) {
+	metadata := map[string]string{}
+	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+		return metadata, nil
+	} else if err != nil {
+		return nil, err
+	}
+	db, err := openIndexDB(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, `SELECT key, value FROM index_metadata`)
+	if err != nil {
+		return metadata, nil
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, err
+		}
+		metadata[key] = value
+	}
+	return metadata, rows.Err()
+}
+
 func indexNeedsRebuild(root, dbPath string) (bool, error) {
 	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
 		return true, nil
@@ -683,38 +841,54 @@ func ftsScores(ctx context.Context, dbPath, query string) (map[string]float64, e
 	return scores, rows.Err()
 }
 
-func lexicalScore(doc Document, terms []string, ftsScore float64) (float64, []string) {
+func lexicalScore(doc Document, terms []string, query string, ftsScore float64, includeHistorical bool) (float64, []string) {
 	var score float64
 	var reasons []string
-	idTokens := identifierTokens(doc.ID)
-	titleTokens := identifierTokens(doc.Title)
-	for _, term := range terms {
-		if idTokens[term] {
-			score += 100
-			reasons = append(reasons, "stable id match")
-			break
+	exactPhrase := false
+	normalizedQuery := normalizePhrase(query)
+	if normalizedQuery != "" {
+		if phraseContains(doc.ID, normalizedQuery) {
+			score += 320
+			exactPhrase = true
+			reasons = append(reasons, "exact stable id phrase match")
+		}
+		if phraseContains(doc.Title, normalizedQuery) {
+			score += 300
+			exactPhrase = true
+			reasons = append(reasons, "exact title phrase match")
 		}
 	}
-	for _, term := range terms {
-		if titleTokens[term] {
-			score += 45
-			reasons = append(reasons, "title match")
-			break
-		}
+	idTokens := identifierTokens(doc.ID)
+	titleTokens := identifierTokens(doc.Title)
+	pathTokens := identifierTokens(doc.Path)
+	idCoverage := tokenCoverage(idTokens, terms)
+	if idCoverage > 0 {
+		score += 140 * idCoverage
+		reasons = append(reasons, "stable id term coverage")
+	}
+	titleCoverage := tokenCoverage(titleTokens, terms)
+	if titleCoverage > 0 {
+		score += 120 * titleCoverage
+		reasons = append(reasons, "title term coverage")
+	}
+	pathCoverage := tokenCoverage(pathTokens, terms)
+	if pathCoverage > 0 {
+		score += 55 * pathCoverage
+		reasons = append(reasons, "path term coverage")
 	}
 	if ftsScore > 0 {
 		score += ftsScore
 		reasons = append(reasons, "full-text match")
 	}
-	score += lifecycleWeight(doc.Status)
+	score += lifecycleWeightFor(doc.Status, includeHistorical, exactPhrase)
 	if len(reasons) == 0 && strings.TrimSpace(strings.Join(terms, " ")) == "" {
 		reasons = append(reasons, "filtered listing")
 	}
 	return score, dedupeStrings(reasons)
 }
 
-func contextScore(doc Document, terms, paths, symbols []string, ftsScore float64) (float64, []string) {
-	score, reasons := lexicalScore(doc, terms, ftsScore)
+func contextScore(doc Document, terms []string, query string, paths, symbols []string, ftsScore float64, includeHistorical bool) (float64, []string) {
+	score, reasons := lexicalScore(doc, terms, query, ftsScore, includeHistorical)
 	for _, path := range paths {
 		if matchesPath(doc, path) {
 			score += 70
@@ -738,7 +912,6 @@ func contextScore(doc Document, terms, paths, symbols []string, ftsScore float64
 			}
 		}
 	}
-	score += lifecycleWeight(doc.Status)
 	return score, dedupeStrings(reasons)
 }
 
@@ -763,7 +936,7 @@ func expandOneHop(candidates []contextCandidate, byID map[string]Document) []con
 					continue
 				}
 				seen[targetID] = true
-				out = append(out, contextCandidate{doc: doc, score: 18 + lifecycleWeight(doc.Status), reasons: []string{"one-hop relation from " + c.doc.ID + " via " + relation}})
+				out = append(out, contextCandidate{doc: doc, score: 18 + lifecycleWeightFor(doc.Status, false, false), reasons: []string{"one-hop relation from " + c.doc.ID + " via " + relation}})
 			}
 		}
 	}
@@ -847,6 +1020,49 @@ func identifierTokens(value string) map[string]bool {
 	return tokens
 }
 
+func tokenCoverage(tokens map[string]bool, terms []string) float64 {
+	if len(terms) == 0 {
+		return 0
+	}
+	matches := 0
+	for _, term := range terms {
+		if tokens[term] {
+			matches++
+		}
+	}
+	return float64(matches) / float64(len(terms))
+}
+
+func phraseContains(value, normalizedQuery string) bool {
+	if normalizedQuery == "" {
+		return false
+	}
+	return strings.Contains(normalizePhrase(value), normalizedQuery)
+}
+
+func exactIdentifierOrTitleMatch(doc Document, query string) bool {
+	normalizedQuery := normalizePhrase(query)
+	return phraseContains(doc.ID, normalizedQuery) || phraseContains(doc.Title, normalizedQuery)
+}
+
+func normalizePhrase(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	space := false
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			space = false
+			continue
+		}
+		if !space {
+			b.WriteByte(' ')
+			space = true
+		}
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
+}
+
 func ftsQuery(query string) string {
 	terms := queryTerms(query)
 	if len(terms) == 0 {
@@ -858,13 +1074,19 @@ func ftsQuery(query string) string {
 	return strings.Join(terms, " OR ")
 }
 
-func lifecycleWeight(status string) float64 {
+func lifecycleWeightFor(status string, includeHistorical, exactPhrase bool) float64 {
 	switch strings.ToLower(status) {
 	case "accepted", "current", "active", "open":
 		return 14
 	case "proposed", "draft", "exploring", "captured":
 		return 5
 	case "superseded", "rejected", "obsolete", "abandoned", "completed", "done", "deprecated", "resolved":
+		if includeHistorical && exactPhrase {
+			return 0
+		}
+		if includeHistorical {
+			return -4
+		}
 		return -20
 	default:
 		return 0

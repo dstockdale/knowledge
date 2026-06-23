@@ -58,6 +58,49 @@ func TestParseObsidianStyleFrontmatter(t *testing.T) {
 	}
 }
 
+func TestParseObsidianSpikeType(t *testing.T) {
+	root := filepath.Join(repoRoot(t), "testdata", "obsidian")
+	doc, err := knowledge.ParseFile(root, filepath.Join(root, "ideas/analytics/clickhouse-client-integration-spike.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.Kind != "spike" {
+		t.Fatalf("kind = %q", doc.Kind)
+	}
+	if doc.ID != "ideas.analytics.clickhouse-client-integration-spike" {
+		t.Fatalf("derived ID = %q", doc.ID)
+	}
+	for _, warning := range doc.Warnings {
+		if warning.Code == "unknown_source_type" {
+			t.Fatalf("type: spike should be known, got warning: %#v", warning)
+		}
+	}
+}
+
+func TestUnknownSourceTypeFallsBackToResearchUnlessStrict(t *testing.T) {
+	root := filepath.Join(repoRoot(t), "testdata", "obsidian")
+	doc, err := knowledge.ParseFile(root, filepath.Join(root, "ideas/unknown-source-shape.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.Kind != "research" {
+		t.Fatalf("kind = %q", doc.Kind)
+	}
+	permissive := knowledge.ValidateWithOptions([]knowledge.Document{doc}, knowledge.ValidationOptions{})
+	if issues := knowledge.FilterIssues(permissive, "error"); len(issues) != 0 {
+		t.Fatalf("unexpected permissive errors: %#v", issues)
+	}
+	warnings := knowledge.FilterIssues(permissive, "warning")
+	if !hasIssueCode(warnings, "unknown_source_type") {
+		t.Fatalf("expected unknown_source_type warning, got %#v", warnings)
+	}
+	strict := knowledge.ValidateWithOptions([]knowledge.Document{doc}, knowledge.ValidationOptions{Strict: true})
+	issues := knowledge.FilterIssues(strict, "error")
+	if !hasIssueCode(issues, "unknown_source_type") {
+		t.Fatalf("expected strict unknown_source_type error, got %#v", issues)
+	}
+}
+
 func TestParseMarkdownWithoutFrontmatter(t *testing.T) {
 	root := filepath.Join(repoRoot(t), "testdata", "obsidian")
 	doc, err := knowledge.ParseFile(root, filepath.Join(root, "architecture/api-boundary.md"))
@@ -116,6 +159,25 @@ func TestValidateDuplicateIDs(t *testing.T) {
 	}
 }
 
+func TestValidationSummaryLimits(t *testing.T) {
+	issues := []knowledge.ValidationIssue{
+		{Severity: "error", Code: "a"},
+		{Severity: "error", Code: "b"},
+		{Severity: "warning", Code: "c"},
+		{Severity: "warning", Code: "d"},
+	}
+	summary := knowledge.SummarizeValidation(4, issues, 1, 1)
+	if summary.IssueCount != 2 || summary.WarningCount != 2 {
+		t.Fatalf("counts = %d/%d", summary.IssueCount, summary.WarningCount)
+	}
+	if len(summary.Issues) != 1 || len(summary.Warnings) != 1 {
+		t.Fatalf("limited issues/warnings = %#v/%#v", summary.Issues, summary.Warnings)
+	}
+	if !summary.IssuesTruncated || !summary.WarningsTruncated {
+		t.Fatalf("expected truncation flags: %#v", summary)
+	}
+}
+
 func TestHistoricalStatusClassification(t *testing.T) {
 	if !knowledge.IsHistorical("superseded") {
 		t.Fatal("superseded should be historical")
@@ -155,4 +217,13 @@ func repoRoot(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return filepath.Clean(filepath.Join(wd, "..", ".."))
+}
+
+func hasIssueCode(issues []knowledge.ValidationIssue, code string) bool {
+	for _, issue := range issues {
+		if issue.Code == code {
+			return true
+		}
+	}
+	return false
 }
